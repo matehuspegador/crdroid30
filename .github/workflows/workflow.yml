@@ -7,9 +7,11 @@ name: Build AtomX Kernel (KernelSU-Next legacy)
 #   3. Fetches KernelSU-Next using its "legacy" (manual-hook) setup, which is
 #      the supported path for pre-GKI / 5.4-class kernels
 #   4. Flips the defconfig to manual-hook mode (kprobes off, CONFIG_KSU on)
-#   5. Best-effort auto-patches the manual hooks that KernelSU-Next needs
+#   5. Tunes CPU governor/scheduler, I/O scheduler, zram and TCP congestion
+#      control for daily-use performance
+#   6. Best-effort auto-patches the manual hooks that KernelSU-Next needs
 #      (fs/exec.c, fs/read_write.c, fs/devpts/inode.c, drivers/input/input.c)
-#   6. Builds the kernel and uploads Image/dtbo as artifacts
+#   7. Builds the kernel and uploads Image/dtbo as artifacts
 #
 # IMPORTANT — read before running:
 #   - The defconfig path/name and build command below are best guesses based
@@ -119,7 +121,7 @@ jobs:
           # kernels 4.19+ use the upstream CROSS_COMPILE_COMPAT name instead.
           # Set both so whichever this tree expects is covered.
           echo "CC=clang" >> "$GITHUB_ENV"
-          echo "CROSS_COMPILE=$GITHUB_WORKSPACE/proton-clang/bin/aarch64-linux-android-" >> "$GITHUB_ENV"
+          echo "CROSS_COMPILE=$GITHUB_WORKSPACE/proton-clang/bin/aarch64-linux-gnu-" >> "$GITHUB_ENV"
           echo "CROSS_COMPILE_ARM32=$GITHUB_WORKSPACE/proton-clang/bin/arm-linux-gnueabi-" >> "$GITHUB_ENV"
           echo "CROSS_COMPILE_COMPAT=$GITHUB_WORKSPACE/proton-clang/bin/arm-linux-gnueabi-" >> "$GITHUB_ENV"
           echo "AR=llvm-ar" >> "$GITHUB_ENV"
@@ -269,99 +271,138 @@ jobs:
           echo "---- diff ----"
           diff -u "$DEFCONFIG_PATH.bak" "$DEFCONFIG_PATH" || true
 
-      - name: Build wifi/network drivers as loadable modules (.ko)
-        # WHY THIS STEP EXISTS -- "no internet after flashing":
+      - name: Tune CPU/IO/zram/network for daily-use performance
+        # Goal: better perceived performance (touch/foreground responsiveness,
+        # app-launch I/O latency, RAM headroom under pressure, and real-world
+        # network throughput) without touching sustained clocks or scheduler
+        # internals — safe for a daily driver. Deliberately NOT porting BORE:
+        # it targets the EEVDF/CFS scheduler in mainline 6.1+, and
+        # backporting it onto a 5.4-class CAF tree (this one) would mean
+        # rewriting core scheduler code, not applying a patch — too high
+        # risk for daily use.
         #
-        # Log evidence from prior runs: cnss2, cnss_utils, cnss_genl,
-        # cnss_prealloc, icnss2 and the whole qcacld-3.0 wifi stack all get
-        # linked straight into vmlinux ("AR drivers/net/wireless/cnss2/built-in.a",
-        # "AR drivers/built-in.a", ...) instead of being built as "LD [M] cnss2.ko"
-        # etc. That means CONFIG_CNSS2 (and friends) are "y" in this defconfig,
-        # not "m".
-        #
-        # This matters because the AnyKernel3 packaging this repo's build.sh
-        # already does is module-aware: the "Package AnyKernel3 zip" step log
-        # shows it creating modules/system/lib/modules/ inside the flashed zip
-        # on every run -- it's ready to ship .ko files -- but that folder comes
-        # out empty, because there are simply no .ko files anywhere in the
-        # build output to put there. The vendor userspace / wifi HAL on this
-        # device expects to insmod a wifi module at boot from that path; with
-        # nothing there, wifi (and by extension mobile-data-over-wifi-tethering
-        # setups, or just wifi itself) never comes up, even though the kernel
-        # boots fine, which matches "flasho e fica sem internet".
-        #
-        # Fix: read the actual CONFIG_* symbol names straight out of this
-        # tree's own Kbuild files for the wifi/cellular driver directories
-        # (data-driven, not a hardcoded guess at symbol names that might not
-        # match this tree), and flip any of them that are currently "y" to "m"
-        # in the defconfig before the build runs.
+        # Every symbol below is checked against this tree's own Kconfig
+        # files first (grep), so nothing gets set blindly if the driver/
+        # symbol doesn't exist in this fork — same anchor-based approach
+        # used elsewhere in this workflow.
         run: |
           set -e
           DEFCONFIG_PATH="${{ steps.discover.outputs.defconfig_path }}"
-          cp "$DEFCONFIG_PATH" "$DEFCONFIG_PATH.premod.bak"
+          cp "$DEFCONFIG_PATH" "$DEFCONFIG_PATH.perf.bak"
 
-          WIFI_DIRS="drivers/net/wireless/cnss2 drivers/net/wireless/cnss_genl drivers/net/wireless/cnss_prealloc drivers/net/wireless/cnss_utils drivers/soc/qcom/icnss2 drivers/staging/qcacld-3.0 drivers/staging/qca-wifi-host-cmn"
-
-          # CONFIG_ICNSS2 is excluded from conversion: building it as a
-          # loadable module fails at modpost with
-          #   ERROR: "__tracepoint_pil_restart_level" [drivers/soc/qcom/icnss2/icnss2.ko] undefined!
-          # because this tree defines that tracepoint in code that stays
-          # built into vmlinux and never exports it for module use (no
-          # EXPORT_TRACEPOINT_SYMBOL for pil_restart_level), so nothing
-          # outside vmlinux can resolve it. Every other CONFIG_* below
-          # (cnss2, cnss_genl, cnss_prealloc, cnss_utils, qcacld-3.0, ...)
-          # links fine as a module -- only icnss2 hits this, so it's the
-          # one left "=y" until the tracepoint export is fixed upstream.
-          EXCLUDE_SYMS="CONFIG_ICNSS2"
-
-          SYMBOLS=""
-          for d in $WIFI_DIRS; do
-            [ -d "$d" ] || continue
-            SYMS=$(grep -rhoE 'obj-\$\(CONFIG_[A-Z0-9_]+\)' "$d" 2>/dev/null | sed -E 's/obj-\$\(([A-Z0-9_]+)\)/\1/' | sort -u)
-            SYMBOLS="${SYMBOLS}"$'\n'"${SYMS}"
-          done
-          SYMBOLS=$(echo "$SYMBOLS" | tr ' ' '\n' | sort -u | grep -v '^$' || true)
-
-          {
-            echo "## Wifi/network module conversion"
-            echo
-            echo "CONFIG_* symbols discovered under: \`$WIFI_DIRS\`"
-            echo '```'
-            echo "$SYMBOLS"
-            echo '```'
-            echo
-            echo "Excluded from conversion (kept built-in): \`$EXCLUDE_SYMS\` -- see step source for why."
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "== Wifi/cellular CONFIG symbols found in tree =="
-          echo "$SYMBOLS"
-
-          CHANGED=""
-          for sym in $SYMBOLS; do
-            case " $EXCLUDE_SYMS " in
-              *" $sym "*) continue ;;
-            esac
-            if grep -qE "^${sym}=y\$" "$DEFCONFIG_PATH"; then
-              sed -i "s/^${sym}=y\$/${sym}=m/" "$DEFCONFIG_PATH"
-              CHANGED="$CHANGED $sym"
+          set_cfg() {
+            local key="$1" val="$2"
+            local sym="${key#CONFIG_}"
+            if ! grep -rqE "^\s*config\s+${sym}\s*$" --include=Kconfig* . 2>/dev/null; then
+              echo "  (skip) ${key}: symbol not found in this tree's Kconfig files"
+              return
             fi
-          done
+            sed -i "/^${key}=/d" "$DEFCONFIG_PATH"
+            sed -i "/^# ${key} is not set/d" "$DEFCONFIG_PATH"
+            echo "${key}=${val}" >> "$DEFCONFIG_PATH"
+            echo "  (set)  ${key}=${val}"
+          }
 
-          # CONFIG_MODULES itself has to be on, or every "=m" above silently
-          # collapses back to built-in (or drops out entirely) at oldconfig time.
-          if ! grep -q '^CONFIG_MODULES=y' "$DEFCONFIG_PATH"; then
-            sed -i '/^# CONFIG_MODULES is not set/d; /^CONFIG_MODULES=/d' "$DEFCONFIG_PATH"
-            echo "CONFIG_MODULES=y" >> "$DEFCONFIG_PATH"
-            CHANGED="$CHANGED CONFIG_MODULES"
+          echo "== CPU governor / scheduler tuning =="
+
+          # schedutil: mandatory governor since Android 10 CDD, well-tested
+          # on this chip family, good balance of responsiveness/battery.
+          set_cfg CONFIG_CPU_FREQ_GOV_SCHEDUTIL y
+          set_cfg CONFIG_CPU_FREQ_DEFAULT_GOV_SCHEDUTIL y
+
+          # CAF's input-boost driver: short freq bump on touch input only,
+          # does not raise sustained clocks. Standard on Lahaina-family
+          # (dubai) kernels.
+          set_cfg CONFIG_CPU_BOOST y
+
+          # WALT (Window-Assisted Load Tracking): gives the scheduler a
+          # more accurate load picture than plain PELT. Native to this
+          # kernel family — this just guards against it being off.
+          set_cfg CONFIG_SCHED_WALT y
+
+          # Foreground-app boost: some CAF/Motorola trees use the older
+          # SchedTune cgroup, others have migrated to mainline uclamp.
+          # Detect which one this tree actually has instead of assuming,
+          # so we don't fight a migration that already happened upstream.
+          if grep -rqE "^\s*config\s+SCHED_TUNE\s*$" --include=Kconfig* . 2>/dev/null; then
+            set_cfg CONFIG_SCHED_TUNE y
+          elif grep -rqE "^\s*config\s+UCLAMP_TASK\s*$" --include=Kconfig* . 2>/dev/null; then
+            echo "  (info) this tree uses UCLAMP_TASK instead of SCHED_TUNE for foreground boost"
+            set_cfg CONFIG_UCLAMP_TASK y
+            set_cfg CONFIG_UCLAMP_TASK_GROUP y
+          else
+            echo "  (skip) neither CONFIG_SCHED_TUNE nor CONFIG_UCLAMP_TASK found in this tree's Kconfig files"
           fi
 
-          if [ -z "$CHANGED" ]; then
-            echo "::warning::No wifi/network CONFIG_* symbols were flipped from y to m. Either they're already '=m' (in which case the 'no internet' issue is elsewhere -- check patch-report.txt / device logcat instead), or the WIFI_DIRS list in this step doesn't match this tree's actual driver layout. Check the symbol list in this run's Summary tab -- if it's empty, the driver directories moved and this step's WIFI_DIRS needs updating to match."
+          echo "== I/O scheduler tuning =="
+
+          # Kyber: low-latency multiqueue-block I/O scheduler, tuned for
+          # UFS/eMMC flash storage found on this chip family. Much better
+          # tail latency for app launches / random reads than the noop/
+          # deadline defaults many CAF defconfigs still ship with.
+          set_cfg CONFIG_MQ_IOSCHED_KYBER y
+
+          # BFQ as a fallback choice (still fair on background writes),
+          # only wired up as the tree's actual boot-time default below if
+          # Kyber isn't present in this fork.
+          set_cfg CONFIG_IOSCHED_BFQ y
+          set_cfg CONFIG_MQ_IOSCHED_BFQ y
+
+          if grep -rqE '^\s*config\s+MQ_IOSCHED_KYBER\s*$' --include=Kconfig* . 2>/dev/null; then
+            sed -i '/^CONFIG_DEFAULT_IOSCHED=/d' "$DEFCONFIG_PATH"
+            echo 'CONFIG_DEFAULT_IOSCHED="kyber"' >> "$DEFCONFIG_PATH"
+            echo "  (set)  CONFIG_DEFAULT_IOSCHED=\"kyber\""
+          elif grep -rqE '^\s*config\s+MQ_IOSCHED_BFQ\s*$' --include=Kconfig* . 2>/dev/null; then
+            sed -i '/^CONFIG_DEFAULT_IOSCHED=/d' "$DEFCONFIG_PATH"
+            echo 'CONFIG_DEFAULT_IOSCHED="bfq"' >> "$DEFCONFIG_PATH"
+            echo "  (set)  CONFIG_DEFAULT_IOSCHED=\"bfq\" (kyber unavailable in this tree)"
           else
-            echo "Flipped to =m:$CHANGED"
+            echo "  (skip) no mq-based I/O scheduler found in this tree's Kconfig files, leaving default"
+          fi
+
+          echo "== zram tuning =="
+
+          # zram + zstd: better compression ratio than lz4 at a CPU cost
+          # this chip family easily absorbs, so more usable RAM under
+          # memory pressure without extra swap thrash. zsmalloc is the
+          # allocator zram needs.
+          set_cfg CONFIG_ZRAM y
+          set_cfg CONFIG_ZSMALLOC y
+          set_cfg CONFIG_ZRAM_MEMORY_TRACKING y
+          if grep -rqE "^\s*config\s+ZRAM_DEF_COMP_ZSTD\s*$" --include=Kconfig* . 2>/dev/null; then
+            set_cfg CONFIG_ZRAM_DEF_COMP_ZSTD y
+          else
+            echo "  (skip) CONFIG_ZRAM_DEF_COMP_ZSTD: symbol not found in this tree's Kconfig files"
+          fi
+          set_cfg CONFIG_CRYPTO_ZSTD y
+
+          echo "== Network stack tuning =="
+
+          # TCP BBR + fq: meaningfully better throughput/latency than the
+          # CUBIC default on real-world mobile networks (handles bufferbloat
+          # much better). Purely a congestion-control algorithm swap, no
+          # effect on kernel stability.
+          set_cfg CONFIG_TCP_CONG_ADVANCED y
+          set_cfg CONFIG_TCP_CONG_BBR y
+          set_cfg CONFIG_NET_SCH_FQ y
+          if grep -rqE "^\s*config\s+TCP_CONG_BBR\s*$" --include=Kconfig* . 2>/dev/null; then
+            sed -i '/^CONFIG_DEFAULT_TCP_CONG=/d' "$DEFCONFIG_PATH"
+            echo 'CONFIG_DEFAULT_TCP_CONG="bbr"' >> "$DEFCONFIG_PATH"
+            echo "  (set)  CONFIG_DEFAULT_TCP_CONG=\"bbr\""
+          else
+            echo "  (skip) CONFIG_DEFAULT_TCP_CONG=\"bbr\": TCP_CONG_BBR not found in this tree's Kconfig files"
           fi
 
           echo "---- diff ----"
-          diff -u "$DEFCONFIG_PATH.premod.bak" "$DEFCONFIG_PATH" || true
+          diff -u "$DEFCONFIG_PATH.perf.bak" "$DEFCONFIG_PATH" || true
+
+          {
+            echo "## Performance tuning (CPU / I/O / zram / network)"
+            echo
+            echo '```diff'
+            diff -u "$DEFCONFIG_PATH.perf.bak" "$DEFCONFIG_PATH" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Auto-patch manual KernelSU-Next hooks
         run: |
